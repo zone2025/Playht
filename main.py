@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import os
 import sys
 import time
@@ -16,33 +18,159 @@ try:
 except ImportError:
     pass
 
-# ==============================================================================
 # 配置区域
-# ==============================================================================
 RENEW_URLS = [
     "https://host2play.gratis/server/renew?i=c957a977-f380-4e2b-86a6-2625b3c5cf32",
     # 添加更多链接
 ]
 
 MAX_CAPTCHA = 3
-MAX_RENEW_RETRIES_PER_URL = 50
+MAX_RENEW_RETRIES_PER_URL = 20
 
-# ==============================================================================
 # 自定义异常
-# ==============================================================================
 class CaptchaBlocked(Exception):
     pass
 
-# ==============================================================================
+# URL 脱敏处理
+def mask_url(url):
+    """隐藏 URL 中 ?i= 后面的 UUID，只保留前1位"""
+    import re
+    return re.sub(r'(\?i=)([^&]{1})([^&]*)', r'\1\2***', url)
+
 # 统一日志
-# ==============================================================================
 def log(msg, level="INFO"):
     prefix = {"INFO": "[INFO]", "WARN": "[WARN]", "ERROR": "[ERROR]"}.get(level, "[INFO]")
     print(f"{prefix} {msg}", flush=True)
 
-# ==============================================================================
+# WARP IP 去重管理
+class WarpManager:
+    """
+    系统级 WARP VPN IP 轮换。
+    _used_ips 记录本次运行已用过的 IP，重复时自动重试。
+    """
+    def __init__(self):
+        self._used_ips: set = set()
+
+    def _run(self, args: list, timeout: int = 30) -> subprocess.CompletedProcess:
+        cmd = ["sudo", "warp-cli", "--accept-tos"] + args
+        log(f"[WARP] 执行: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.stdout.strip():
+            log(f"[WARP] stdout: {result.stdout.strip()}")
+        if result.stderr.strip():
+            log(f"[WARP] stderr: {result.stderr.strip()}", "WARN")
+        return result
+
+    def _get_current_ip(self) -> str:
+        try:
+            r = subprocess.run(
+                ["curl", "-s", "--max-time", "15", "https://api.ipify.org"],
+                capture_output=True, text=True, timeout=20
+            )
+            return r.stdout.strip()
+        except Exception:
+            return ""
+
+    def _wait_connected(self, max_wait: int = 60) -> bool:
+        log(f"[WARP] 等待 VPN 连接就绪（最多 {max_wait}s）...")
+        start = time.time()
+        while time.time() - start < max_wait:
+            try:
+                r = subprocess.run(
+                    ["curl", "-s", "--max-time", "10",
+                     "https://www.cloudflare.com/cdn-cgi/trace"],
+                    capture_output=True, text=True, timeout=15
+                )
+                trace = r.stdout
+                if "warp=on" in trace or "warp=plus" in trace:
+                    ip_lines = [l for l in trace.splitlines() if l.startswith("ip=")]
+                    ip = ip_lines[0].split("=")[1] if ip_lines else "unknown"
+                    log(f"[WARP] ✅ VPN 就绪，出口 IP: {ip}")
+                    return True
+            except Exception as e:
+                log(f"[WARP] 等待中... ({e})", "WARN")
+            time.sleep(3)
+        log("[WARP] ❌ 等待超时，warp 未激活", "ERROR")
+        return False
+
+    def _do_one_rotate(self) -> str:
+        """
+        执行一次完整的注销 → 重注册 → 连接流程。
+        返回新 IP，失败返回空字符串。
+        """
+        self._run(["disconnect"])
+        time.sleep(2)
+        self._run(["registration", "delete"])
+        time.sleep(2)
+        result = self._run(["registration", "new"], timeout=30)
+        if result.returncode != 0:
+            log("[WARP] ❌ 注册失败", "ERROR")
+            return ""
+        time.sleep(3)
+        self._run(["connect"])
+        time.sleep(5)
+        if not self._wait_connected(max_wait=60):
+            log("[WARP] ❌ WARP 连接失败", "ERROR")
+            return ""
+        return self._get_current_ip()
+
+    def rotate_ip(self, attempt_idx: int = 0, max_attempts: int = 5) -> bool:
+        """
+        轮换 WARP IP。
+        若新 IP 已被本次运行使用过则继续重试，最多尝试 max_attempts 次。
+        attempt_idx: 当前是第几次尝试（0-based），仅用于日志展示。
+        """
+        log(f"[WARP] ========== 第 {attempt_idx + 1} 次 IP 轮换 ==========")
+        log(f"[WARP] 已用 IP 池: {self._used_ips if self._used_ips else '(空)'}")
+
+        old_ip = self._get_current_ip()
+        log(f"[WARP] 旧 IP: {old_ip}")
+
+        for i in range(1, max_attempts + 1):
+            log(f"[WARP] 轮换尝试 {i}/{max_attempts}")
+            new_ip = self._do_one_rotate()
+
+            if not new_ip:
+                log(f"[WARP] ⚠️  第 {i} 次轮换失败，继续重试", "WARN")
+                continue
+
+            if new_ip in self._used_ips:
+                log(f"[WARP] ♻️  IP {new_ip} 已被本次运行使用过，继续尝试...", "WARN")
+                continue
+
+            # 拿到未用过的新 IP
+            self._used_ips.add(new_ip)
+            if new_ip != old_ip:
+                log(f"[WARP] ✅ IP 已变化: {old_ip} → {new_ip}")
+            else:
+                log(f"[WARP] ⚠️  IP 与旧 IP 相同（{new_ip}），但未被本轮其他请求使用，接受", "WARN")
+            log(f"[WARP] 已用 IP 池: {self._used_ips}")
+            return True
+
+        # 全部尝试都拿到重复 IP，接受并继续
+        log(f"[WARP] ⚠️  {max_attempts} 次尝试均为重复 IP，使用当前 IP 继续执行", "WARN")
+        new_ip = self._get_current_ip()
+        if new_ip:
+            self._used_ips.add(new_ip)
+        return True
+
+    def record_initial_ip(self):
+        """记录初始 IP，避免首次续期就分配到重复 IP。"""
+        ip = self._get_current_ip()
+        if ip:
+            self._used_ips.add(ip)
+            log(f"[WARP] 记录初始 IP: {ip}，已用 IP 池: {self._used_ips}")
+
+# 全局 WARP 管理器（单例）
+_warp_manager: WarpManager = None
+
+def get_warp_manager() -> WarpManager:
+    global _warp_manager
+    if _warp_manager is None:
+        _warp_manager = WarpManager()
+    return _warp_manager
+
 # Telegram 通知
-# ==============================================================================
 def send_tg_photo(token, chat_id, photo_path, caption, parse_mode='HTML'):
     if not token or not chat_id:
         log("未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过通知。", "WARN")
@@ -64,9 +192,7 @@ def send_tg_photo(token, chat_id, photo_path, caption, parse_mode='HTML'):
     except Exception as e:
         log(f"Telegram 图片通知异常: {e}", "ERROR")
 
-# ==============================================================================
 # 页面元素提取
-# ==============================================================================
 def get_server_name(page):
     try:
         ele = page.ele('#serverName', timeout=2)
@@ -83,7 +209,6 @@ def get_expire_time(page):
             return ele.text.strip()
     except Exception:
         pass
-    # 回退：源版的方式
     selectors = ['text:Expires in:', 'text:Deletes on:']
     for selector in selectors:
         try:
@@ -98,10 +223,9 @@ def get_expire_time(page):
             pass
     return "未知"
 
-# ==============================================================================
 # 构建通知
-# ==============================================================================
 def build_notification(success, url, server_name, old_expire, new_expire=None, failure_reason=""):
+    masked = mask_url(url)
     if success:
         lines = [
             "✅ 续订成功",
@@ -131,41 +255,7 @@ def capture_page_screenshot(page, file_name):
         log(f"截图失败: {e}", "WARN")
         return None
 
-# ==============================================================================
-# WARP 重连
-# ==============================================================================
-def restart_warp():
-    log("正在重启 WARP 以更换 IP...")
-    try:
-        old_ip = requests.get("https://api.ipify.org", timeout=10).text
-        log(f"当前 IP: {old_ip}")
-    except Exception:
-        old_ip = "未知"
-    try:
-        subprocess.run(["sudo", "warp-cli", "--accept-tos", "disconnect"],
-                      check=False, timeout=30, capture_output=True)
-        time.sleep(3)
-        try:
-            subprocess.run(["sudo", "warp-cli", "--accept-tos", "registration", "delete"],
-                          check=True, timeout=30, capture_output=True)
-        except subprocess.CalledProcessError:
-            log("删除注册失败（可能未注册）", "WARN")
-        subprocess.run(["sudo", "warp-cli", "--accept-tos", "registration", "new"],
-                      check=True, timeout=30, capture_output=True)
-        time.sleep(3)
-        subprocess.run(["sudo", "warp-cli", "--accept-tos", "connect"],
-                      check=True, timeout=30, capture_output=True)
-        time.sleep(10)
-        new_ip = requests.get("https://api.ipify.org", timeout=10).text
-        log(f"WARP 重连成功，新 IP: {new_ip}")
-        return True
-    except Exception as e:
-        log(f"WARP 重连失败: {e}", "ERROR")
-        return False
-
-# ==============================================================================
 # reCAPTCHA 辅助函数
-# ==============================================================================
 def find_recaptcha_frame(page, kind):
     try:
         for frame in page.get_frames():
@@ -180,7 +270,9 @@ def is_recaptcha_solved(page):
     try:
         for frame in page.get_frames():
             try:
-                token = frame.run_js("return document.querySelector(\"textarea[name='g-recaptcha-response']\")?.value")
+                token = frame.run_js(
+                    "return document.querySelector(\"textarea[name='g-recaptcha-response']\")?.value"
+                )
                 if token and len(token) > 30:
                     return True
             except Exception:
@@ -190,7 +282,9 @@ def is_recaptcha_solved(page):
     anchor = find_recaptcha_frame(page, "anchor")
     if anchor:
         try:
-            checked = anchor.run_js("return document.querySelector('#recaptcha-anchor')?.getAttribute('aria-checked') === 'true'")
+            checked = anchor.run_js(
+                "return document.querySelector('#recaptcha-anchor')?.getAttribute('aria-checked') === 'true'"
+            )
             if checked:
                 return True
         except Exception:
@@ -463,12 +557,14 @@ def solve_recaptcha(page):
             return True
         reload_challenge(page)
         time.sleep(random.uniform(2, 4))
+
     raise RuntimeError("验证码达到最大尝试次数")
 
-# ==============================================================================
-# 单个 URL 续期流程（去掉 IP 预检，直接尝试 + 封锁换 IP）
-# ==============================================================================
-def renew_single_url(url):
+# 单个 URL 续期流程（IP 去重重试）
+def renew_single_url(url, attempt_idx: int = 0):
+    """
+    attempt_idx: 当前是第几个 URL（0-based），传给 WarpManager 用于日志展示。
+    """
     success = False
     server_name = "未知"
     old_expire = "未知"
@@ -500,7 +596,7 @@ def renew_single_url(url):
                 co.set_argument('--window-size=1280,720')
                 co.set_argument('--log-level=3')
                 co.set_argument('--silent')
-                # 关键：每次用独立的用户数据目录，避免残留 cookie/指纹
+                # 每次独立用户数据目录，避免残留 cookie/指纹
                 user_data_dir = tempfile.mkdtemp()
                 co.set_user_data_path(user_data_dir)
                 co.auto_port()
@@ -520,7 +616,7 @@ def renew_single_url(url):
                     Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
                 """)
 
-                log(f"访问: {url}")
+                log(f"访问: {mask_url(url)}")
                 page.get(url, retry=3)
                 time.sleep(random.uniform(5, 8))
 
@@ -541,7 +637,7 @@ def renew_single_url(url):
                     consent_btn.click()
                     time.sleep(3)
 
-                # 关键：积累真实的鼠标轨迹和滚动数据（源版有，新版删了）
+                # 积累鼠标轨迹和滚动数据
                 for _ in range(3):
                     scroll_y = random.randint(200, 600)
                     page.scroll.down(scroll_y)
@@ -555,14 +651,18 @@ def renew_single_url(url):
                 if renew_btn1:
                     try:
                         renew_btn1.click()
-                    except:
+                    except Exception:
                         renew_btn1.click(by_js=True)
                 else:
-                    page.run_js("document.querySelectorAll('button').forEach(b => {if(b.textContent.includes('Renew server')) b.click();});")
+                    page.run_js(
+                        "document.querySelectorAll('button').forEach(b => "
+                        "{if(b.textContent.includes('Renew server')) b.click();});"
+                    )
                 time.sleep(3)
 
                 for _ in range(8):
-                    if page.ele('text:Expires in:', timeout=0.5) or page.ele('text:Deletes on:', timeout=0.5):
+                    if (page.ele('text:Expires in:', timeout=0.5)
+                            or page.ele('text:Deletes on:', timeout=0.5)):
                         break
                     time.sleep(1)
 
@@ -570,7 +670,7 @@ def renew_single_url(url):
                 if renew_btn2:
                     try:
                         renew_btn2.click()
-                    except:
+                    except Exception:
                         renew_btn2.click(by_js=True)
                 time.sleep(random.uniform(7, 10))
 
@@ -589,15 +689,16 @@ def renew_single_url(url):
                 try:
                     solved = solve_recaptcha(page)
                 except CaptchaBlocked:
-                    log("IP 被封锁，换 IP 后重试", "WARN")
+                    log("IP 被封锁，使用 WARP 去重轮换后重试", "WARN")
                     failure_reason = "IP 被 reCAPTCHA 封锁"
                     try:
                         page.quit()
-                    except:
+                    except Exception:
                         pass
                     page = None
                     if attempt < MAX_RENEW_RETRIES_PER_URL:
-                        restart_warp()
+                        # ✅ 去重轮换：传入当前尝试序号
+                        get_warp_manager().rotate_ip(attempt_idx=attempt - 1)
                         continue
                     break
                 except Exception as e:
@@ -610,11 +711,13 @@ def renew_single_url(url):
                     break
 
                 log("点击最终 Renew 按钮")
-                final_btn = page.ele('xpath://button[normalize-space(text())="Renew"]', timeout=3)
+                final_btn = page.ele(
+                    'xpath://button[normalize-space(text())="Renew"]', timeout=3
+                )
                 if final_btn:
                     try:
                         final_btn.click()
-                    except:
+                    except Exception:
                         final_btn.click(by_js=True)
                     time.sleep(10)
                     new_expire = get_expire_time(page)
@@ -638,48 +741,60 @@ def renew_single_url(url):
                     if page:
                         try:
                             page.quit()
-                        except:
+                        except Exception:
                             pass
                         page = None
-                    restart_warp()
+                    # ✅ 去重轮换
+                    get_warp_manager().rotate_ip(attempt_idx=attempt - 1)
                     continue
                 break
+
             finally:
                 if page:
-                    screen_name = f"host2play-{server_name}-{'success' if success else 'fail'}.png"
-                    screenshot_path = capture_page_screenshot(page, os.path.join(screenshot_dir, screen_name))
+                    screen_name = (
+                        f"host2play-{server_name}"
+                        f"-{'success' if success else 'fail'}.png"
+                    )
+                    screenshot_path = capture_page_screenshot(
+                        page, os.path.join(screenshot_dir, screen_name)
+                    )
                     try:
                         page.quit()
-                    except:
+                    except Exception:
                         pass
     finally:
         vdisplay.stop()
 
     return success, server_name, old_expire, new_expire, screenshot_path, failure_reason
 
-# ==============================================================================
 # 主入口
-# ==============================================================================
 def main():
     tg_token = os.getenv("TG_BOT_TOKEN")
     tg_chat_id = os.getenv("TG_CHAT_ID")
+
     if not RENEW_URLS:
         log("请在 RENEW_URLS 列表中添加续期链接", "ERROR")
         sys.exit(1)
 
+    # ✅ 记录初始 IP，防止首个 URL 分配到已用 IP
+    get_warp_manager().record_initial_ip()
+
     total_success = 0
     for idx, url in enumerate(RENEW_URLS, 1):
         log(f"{'#'*60}")
-        log(f"处理第 {idx} 个链接: {url}")
+        log(f"处理第 {idx} 个链接: {mask_url(url)}")
         log(f"{'#'*60}")
 
-        success, server_name, old_expire, new_expire, screenshot, failure_reason = renew_single_url(url)
+        success, server_name, old_expire, new_expire, screenshot, failure_reason = \
+            renew_single_url(url, attempt_idx=idx - 1)
 
         if success:
             caption = build_notification(True, url, server_name, old_expire, new_expire)
             total_success += 1
         else:
-            caption = build_notification(False, url, server_name, old_expire, failure_reason=failure_reason)
+            caption = build_notification(
+                False, url, server_name, old_expire, failure_reason=failure_reason
+            )
 
         send_tg_photo(tg_token, tg_chat_id, screenshot, caption, parse_mode='HTML')
 
